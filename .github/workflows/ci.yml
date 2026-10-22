@@ -1,0 +1,317 @@
+# GitHub Actions implementation of the secure pipeline.
+#
+# This workflow and .gitlab-ci.yml implement the SAME flow, stage for
+# stage, against the SAME promotion contract (scripts/promote.sh):
+#
+#   build -> test -> quality (SonarQube gate) -> image
+#         -> scan (Anchore) -> compliance (OpenSCAP)
+#         -> promote-dev (automatic)
+#         -> promote-stage (Environment approval)
+#         -> promote-prod (Environment approval)
+#
+# Manual approval on GitHub is expressed with Environments: configure
+# "Required reviewers" on the `stage` and `production` environments
+# in Settings > Environments. A job targeting a protected environment
+# does not start until a reviewer approves — that approval is the
+# human gate, and it is why PROMOTE_APPROVED is only set inside those
+# jobs (see scripts/promote.sh).
+#
+# Required repository secrets (Settings > Secrets and variables):
+#   SONAR_HOST_URL, SONAR_TOKEN     SonarQube connection
+#   REGISTRY, REGISTRY_USERNAME, REGISTRY_PASSWORD
+#                                   container registry (for GHCR, use
+#                                   ghcr.io + github.token instead)
+# Variables:
+#   ANCHORE_FAIL_SEVERITY           default: high
+
+name: secure-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: sample-service
+  IMAGE_TAG: sha-${{ github.sha }}
+  SONAR_PROJECT_KEY: sample-service
+  ANCHORE_FAIL_SEVERITY: ${{ vars.ANCHORE_FAIL_SEVERITY || 'high' }}
+
+jobs:
+  # -------------------------------------------------------------- build
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (runtime has no third-party dependencies)
+        run: pip install -r requirements.txt
+      - name: Byte-compile the service
+        run: python -m compileall -q app
+
+  # --------------------------------------------------------------- test
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Unit tests with coverage gate
+        run: >
+          pytest -q --cov=app --cov-report=xml:coverage.xml
+          --cov-fail-under=80 --junitxml=junit.xml
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            coverage.xml
+            junit.xml
+
+  # ------------------------------------------------------------ quality
+  quality:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'  # gate verdicts apply to built artifacts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # SonarQube needs full history for new-code analysis
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: test-reports
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v3
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+      - name: Wait for the quality gate verdict
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GATE_STATUS_FILE: gate-sonar.env
+        run: ./scripts/check_sonar_gate.sh
+      - name: Upload gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-sonar
+          path: gate-sonar.env
+
+  # -------------------------------------------------------------- image
+  image:
+    runs-on: ubuntu-latest
+    needs: quality
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build and push ONCE, tagged with the commit
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.REGISTRY }}/team/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+      # steps.build.outputs.digest is the immutable identity of the
+      # image. Every later job uses repo@digest — never the tag — so
+      # what is scanned and what is promoted are the same bits.
+
+  # --------------------------------------------------------------- scan
+  scan:
+    runs-on: ubuntu-latest
+    needs: image
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Generate SBOM for the exact digest (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ secrets.REGISTRY }}/team/${{ env.IMAGE_NAME }}@${{ needs.image.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      - name: Anchore vulnerability scan (report)
+        uses: anchore/scan-action@v6
+        with:
+          image: ${{ secrets.REGISTRY }}/team/${{ env.IMAGE_NAME }}@${{ needs.image.outputs.digest }}
+          output-format: json
+          fail-build: false
+      - name: Anchore gate — fail on fixable High+ vulnerabilities
+        id: anchore-gate
+        uses: anchore/scan-action@v6
+        with:
+          image: ${{ secrets.REGISTRY }}/team/${{ env.IMAGE_NAME }}@${{ needs.image.outputs.digest }}
+          fail-build: true
+          severity-cutoff: ${{ env.ANCHORE_FAIL_SEVERITY }}
+          only-fixed: true
+      - name: Record gate verdict
+        if: always()
+        run: |
+          if [ "${{ steps.anchore-gate.outcome }}" = "success" ]; then
+            echo "ANCHORE_SCAN=PASS" > gate-anchore.env
+          else
+            echo "ANCHORE_SCAN=FAIL" > gate-anchore.env
+          fi
+      - name: Upload scan evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-anchore
+          path: |
+            gate-anchore.env
+            sbom.spdx.json
+
+  # --------------------------------------------------------- compliance
+  compliance:
+    runs-on: ubuntu-latest
+    needs: image
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Pull the image by digest
+        run: docker pull "${{ secrets.REGISTRY }}/team/${{ env.IMAGE_NAME }}@${{ needs.image.outputs.digest }}"
+      - name: OpenSCAP compliance scan of the image
+        env:
+          IMAGE_REF: ${{ secrets.REGISTRY }}/team/${{ env.IMAGE_NAME }}@${{ needs.image.outputs.digest }}
+          GATE_STATUS_FILE: gate-openscap.env
+        run: ./scripts/run_openscap.sh
+      - name: Upload compliance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-openscap
+          path: |
+            gate-openscap.env
+            openscap-results.xml
+            openscap-report.html
+
+  # ------------------------------------------------------------ promote
+  # All three promotion jobs download the three gate-evidence files,
+  # assemble gate-status.env, and hand it to the shared promotion
+  # script. The script enforces the contract; the YAML only wires the
+  # platform's approval mechanism to it.
+  promote-dev:
+    runs-on: ubuntu-latest
+    needs: [quality, scan, compliance, image]
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Set up Buildx (imagetools does the registry-side re-tag)
+        uses: docker/setup-buildx-action@v3
+      - name: Download gate evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gate-*
+          merge-multiple: true
+      - name: Assemble gate evidence
+        run: cat gate-sonar.env gate-anchore.env gate-openscap.env > gate-status.env && cat gate-status.env
+      - name: Promote the digest to dev
+        env:
+          IMAGE_REF: ${{ secrets.REGISTRY }}/team/${{ env.IMAGE_NAME }}@${{ needs.image.outputs.digest }}
+          TARGET_ENV: dev
+        run: ./scripts/promote.sh
+
+  promote-stage:
+    runs-on: ubuntu-latest
+    needs: [promote-dev, image]
+    # Human gate: this job waits for a required reviewer's approval
+    # on the `stage` Environment before it starts.
+    environment: stage
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Download gate evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gate-*
+          merge-multiple: true
+      - name: Assemble gate evidence
+        run: cat gate-sonar.env gate-anchore.env gate-openscap.env > gate-status.env && cat gate-status.env
+      - name: Promote the digest to stage
+        env:
+          IMAGE_REF: ${{ secrets.REGISTRY }}/team/${{ env.IMAGE_NAME }}@${{ needs.image.outputs.digest }}
+          TARGET_ENV: stage
+          # Set ONLY inside this Environment-approved job. This is what
+          # lets scripts/promote.sh tell an approved promotion from a
+          # direct script invocation.
+          PROMOTE_APPROVED: "true"
+        run: ./scripts/promote.sh
+
+  promote-prod:
+    runs-on: ubuntu-latest
+    needs: [promote-stage, image]
+    # Human gate: required reviewer approval on the `production`
+    # Environment. There is deliberately no schedule, no auto-merge,
+    # and no API shortcut around this job.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Download gate evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gate-*
+          merge-multiple: true
+      - name: Assemble gate evidence
+        run: cat gate-sonar.env gate-anchore.env gate-openscap.env > gate-status.env && cat gate-status.env
+      - name: Promote the digest to production
+        env:
+          IMAGE_REF: ${{ secrets.REGISTRY }}/team/${{ env.IMAGE_NAME }}@${{ needs.image.outputs.digest }}
+          TARGET_ENV: prod
+          PROMOTE_APPROVED: "true"
+        run: ./scripts/promote.sh

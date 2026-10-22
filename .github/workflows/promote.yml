@@ -1,0 +1,87 @@
+# Manual promotion of an ALREADY-BUILT, ALREADY-GATED image digest.
+#
+# Use case: the CI workflow (ci.yml) promoted a digest to dev, and a
+# release manager later decides — outside the original run — to move
+# that same digest to stage or production. This workflow does NOT
+# rebuild, re-scan, or re-gate anything. It:
+#
+#   1. Takes the digest, the source tag, and the CI run ID that
+#      produced the gate evidence.
+#   2. Downloads the gate-evidence artifacts from THAT run and refuses
+#      to continue unless every gate recorded PASS (enforced again by
+#      scripts/promote.sh).
+#   3. Runs in the target GitHub Environment, so stage/production
+#      still require a human reviewer's approval before the job
+#      starts. There is no path around the approval here either.
+#
+# Inputs:
+#   digest      full digest, e.g. sha256:abc123...
+#   source_tag  the build tag for that digest, e.g. sha-abc1234
+#   target_env  stage or production
+#   ci_run_id   numeric ID of the ci.yml run that gated this digest
+
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: "Image digest to promote (sha256:...)"
+        required: true
+        type: string
+      source_tag:
+        description: "Build tag for that digest (sha-<short-sha>)"
+        required: true
+        type: string
+      target_env:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - stage
+          - production
+      ci_run_id:
+        description: "Run ID of the CI workflow that produced the gate evidence"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read  # required to download artifacts from the CI run
+  packages: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    # The environment name comes from the input, so the approval rule
+    # that fires is the one configured for the actual target.
+    environment: ${{ inputs.target_env }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Download gate evidence from the original CI run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gate-*
+          merge-multiple: true
+          run-id: ${{ inputs.ci_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Assemble gate evidence
+        run: cat gate-sonar.env gate-anchore.env gate-openscap.env > gate-status.env && cat gate-status.env
+      - name: Promote the digest
+        env:
+          IMAGE_REF: ${{ secrets.REGISTRY }}/team/sample-service@${{ inputs.digest }}
+          IMAGE_TAG: ${{ inputs.source_tag }}
+          # GitHub Environment inputs use "production"; the promotion
+          # contract's environment names are dev/stage/prod.
+          TARGET_ENV: ${{ inputs.target_env == 'production' && 'prod' || 'stage' }}
+          # Set only here, inside the Environment-approved job.
+          PROMOTE_APPROVED: "true"
+        run: ./scripts/promote.sh

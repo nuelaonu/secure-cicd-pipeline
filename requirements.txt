@@ -1,0 +1,11 @@
+# Runtime dependencies: none.
+#
+# The sample service is implemented with the Python standard library
+# only (see app/main.py), so this file is intentionally empty of
+# packages. It exists so the pipeline's build stage has a stable
+# install step: if the service grows a real dependency, pin it here
+# with an exact version and a hash, e.g.
+#
+#   fastapi==0.115.0 --hash=sha256:...
+#
+# and the rest of the pipeline needs no changes.

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+
+# Local environment / secrets — never commit real values.
+# CI variables live in the CI system (masked + protected), not in git.
+.env
+
+# Build and scan artifacts produced by the pipeline
+dist/
+build/
+*.egg-info/
+sbom*.json
+grype-report*.json
+anchore-report*.json
+openscap-report*.html
+openscap-results*.xml
+gate-status.env
+
+# Docker
+.docker/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

@@ -1,0 +1,32 @@
+# Optional local stack — NOT a deployment mechanism.
+#
+# `docker compose up app` runs the sample service exactly as the
+# pipeline image runs it, for local verification of endpoints.
+#
+# The `sonarqube` service is behind a profile because it is heavy and
+# only needed when exercising the quality-gate step locally:
+#   docker compose --profile tools up sonarqube
+# In CI, SonarQube is a shared platform service reached through
+# SONAR_HOST_URL, not something each pipeline stands up.
+services:
+  app:
+    build: .
+    image: sample-service:local
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      SERVICE_VERSION: "local"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  sonarqube:
+    profiles: ["tools"]
+    image: sonarqube:community
+    ports:
+      - "9000:9000"
+    environment:
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"

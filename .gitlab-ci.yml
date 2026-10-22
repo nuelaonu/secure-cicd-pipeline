@@ -1,0 +1,276 @@
+# GitLab CI implementation of the secure pipeline.
+#
+# This file and .github/workflows/ci.yml implement the SAME flow,
+# stage for stage, against the SAME promotion contract
+# (scripts/promote.sh). Neither pipeline is a translation of the
+# other; both are native to their platform and converge on the
+# shared scripts in scripts/.
+#
+# Stage flow:
+#   build -> test -> quality (SonarQube gate) -> image
+#         -> scan (Anchore/Grype) -> compliance (OpenSCAP)
+#         -> promote-dev (automatic)
+#         -> promote-stage (manual) -> promote-prod (manual)
+#
+# Required CI/CD variables (Settings > CI/CD > Variables):
+#   SONAR_HOST_URL, SONAR_TOKEN          masked
+#   CI_REGISTRY_*                        provided by GitLab for the
+#                                        built-in registry; for an
+#                                        external registry set them
+#                                        as masked variables instead
+#   ANCHORE_FAIL_SEVERITY                default: high
+# Promotion variables should additionally be PROTECTED so only
+# protected branches and approved jobs can see registry credentials.
+
+stages:
+  - build
+  - test
+  - quality
+  - image
+  - scan
+  - compliance
+  - promote-dev
+  - promote-stage
+  - promote-prod
+
+variables:
+  # The image is built ONCE, tagged with the commit, and from then on
+  # addressed by digest. Promotion re-tags this digest; it never
+  # rebuilds (see scripts/promote.sh).
+  IMAGE_TAG: "sha-$CI_COMMIT_SHORT_SHA"
+  ANCHORE_FAIL_SEVERITY: "high"
+  SONAR_PROJECT_KEY: "sample-service"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+default:
+  cache:
+    key:
+      files:
+        - requirements-dev.txt
+    paths:
+      - .cache/pip
+
+# ---------------------------------------------------------------- build
+build:
+  stage: build
+  image: python:3.12-slim
+  script:
+    - pip install --no-cache-dir -r requirements.txt
+    - python -m compileall -q app
+    - echo "Build OK for $CI_COMMIT_SHORT_SHA"
+
+# ----------------------------------------------------------------- test
+unit-test:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pip install --no-cache-dir -r requirements-dev.txt
+    - pytest -q --cov=app --cov-report=xml:coverage.xml
+      --cov-fail-under=80 --junitxml=junit.xml
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths:
+      - coverage.xml
+    expire_in: 30 days
+
+# -------------------------------------------------------------- quality
+sonarqube-gate:
+  stage: quality
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: "0"
+    GATE_STATUS_FILE: "gate-sonar.env"
+  script:
+    - sonar-scanner
+      -Dsonar.projectKey="$SONAR_PROJECT_KEY"
+      -Dsonar.sources=app
+      -Dsonar.tests=tests
+      -Dsonar.python.coverage.reportPaths=coverage.xml
+    # The scanner only submits the analysis. The gate verdict is
+    # computed server-side; poll for it and fail here if it is not OK,
+    # so gated code never reaches the image build.
+    - ./scripts/check_sonar_gate.sh
+  artifacts:
+    paths:
+      - gate-sonar.env
+    expire_in: 30 days
+
+# ---------------------------------------------------------------- image
+image-build:
+  stage: image
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER"
+      --password-stdin "$CI_REGISTRY"
+  script:
+    - docker build --pull -t "$CI_REGISTRY_IMAGE:$IMAGE_TAG" .
+    - docker push "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
+    # Capture the immutable digest. Every later stage uses this
+    # digest — never the mutable tag — so what is scanned and what is
+    # promoted are guaranteed to be the same bits that were built.
+    - DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}'
+      "$CI_REGISTRY_IMAGE:$IMAGE_TAG" | cut -d'@' -f2)
+    - echo "IMAGE_DIGEST=$DIGEST" > image.env
+    - echo "Built $CI_REGISTRY_IMAGE:$IMAGE_TAG ($DIGEST)"
+  artifacts:
+    reports:
+      dotenv: image.env
+    expire_in: 30 days
+
+# ----------------------------------------------------------------- scan
+anchore-scan:
+  stage: scan
+  image:
+    name: anchore/grype:v0.86.1
+    entrypoint: [""]
+  variables:
+    GATE_STATUS_FILE: "gate-anchore.env"
+  needs:
+    - job: image-build
+      artifacts: true
+  script:
+    # SBOM first: the inventory of the exact digest, kept as evidence.
+    - grype "$CI_REGISTRY_IMAGE@$IMAGE_DIGEST"
+      --output json --file grype-report.json || true
+    - grype "$CI_REGISTRY_IMAGE@$IMAGE_DIGEST"
+      --output spdx-json --file sbom.spdx.json || true
+    # The gate itself: fail on FIXABLE vulnerabilities at or above the
+    # configured severity. Unfixable findings are reported, not gated
+    # (see docs/gate-policy.md).
+    - |
+      if grype "$CI_REGISTRY_IMAGE@$IMAGE_DIGEST" \
+          --fail-on "$ANCHORE_FAIL_SEVERITY" --only-fixed --quiet; then
+        echo "ANCHORE_SCAN=PASS" > "$GATE_STATUS_FILE"
+      else
+        echo "ANCHORE_SCAN=FAIL" > "$GATE_STATUS_FILE"
+        echo "Anchore gate failed: fixable $ANCHORE_FAIL_SEVERITY+ vulnerabilities present."
+        exit 1
+      fi
+  artifacts:
+    when: always
+    paths:
+      - grype-report.json
+      - sbom.spdx.json
+      - gate-anchore.env
+    expire_in: 30 days
+
+# ----------------------------------------------------------- compliance
+openscap-scan:
+  stage: compliance
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    GATE_STATUS_FILE: "gate-openscap.env"
+  needs:
+    - job: image-build
+      artifacts: true
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER"
+      --password-stdin "$CI_REGISTRY"
+    - docker pull "$CI_REGISTRY_IMAGE@$IMAGE_DIGEST"
+  script:
+    # Container-based OpenSCAP evaluation of the built image against
+    # the compliance profile. Fails the job on any applicable failed
+    # rule; the full XCCDF results and HTML report are kept as
+    # artifacts. See scripts/run_openscap.sh for scope notes.
+    - IMAGE_REF="$CI_REGISTRY_IMAGE@$IMAGE_DIGEST" ./scripts/run_openscap.sh
+  artifacts:
+    when: always
+    paths:
+      - openscap-results.xml
+      - openscap-report.html
+      - gate-openscap.env
+    expire_in: 30 days
+
+# -------------------------------------------------------------- promote
+# All three promotion jobs assemble the gate evidence written by the
+# quality/scan/compliance jobs and hand it to the shared promotion
+# script. The script — not the YAML — enforces the contract: digest
+# pinned, every gate PASS, approval flag present for stage/prod.
+.promote:
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  needs:
+    - job: image-build
+      artifacts: true
+    - job: sonarqube-gate
+      artifacts: true
+    - job: anchore-scan
+      artifacts: true
+    - job: openscap-scan
+      artifacts: true
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER"
+      --password-stdin "$CI_REGISTRY"
+    - docker buildx create --use || true
+    - cat gate-sonar.env gate-anchore.env gate-openscap.env > gate-status.env
+    - cat gate-status.env
+
+promote-dev:
+  extends: .promote
+  stage: promote-dev
+  script:
+    - IMAGE_REF="$CI_REGISTRY_IMAGE@$IMAGE_DIGEST"
+      TARGET_ENV=dev ./scripts/promote.sh
+  environment:
+    name: dev
+
+promote-stage:
+  extends: .promote
+  stage: promote-stage
+  # Manual: a human clicks this job after reviewing the gate reports.
+  # PROMOTE_APPROVED is set here — and only here / in promote-prod —
+  # which is what lets scripts/promote.sh distinguish an approved run
+  # from someone invoking the stage directly.
+  when: manual
+  variables:
+    PROMOTE_APPROVED: "true"
+  script:
+    - IMAGE_REF="$CI_REGISTRY_IMAGE@$IMAGE_DIGEST"
+      TARGET_ENV=stage ./scripts/promote.sh
+  environment:
+    name: stage
+
+promote-prod:
+  extends: .promote
+  stage: promote-prod
+  when: manual
+  variables:
+    PROMOTE_APPROVED: "true"
+  needs:
+    - job: image-build
+      artifacts: true
+    - job: sonarqube-gate
+      artifacts: true
+    - job: anchore-scan
+      artifacts: true
+    - job: openscap-scan
+      artifacts: true
+    - job: promote-stage
+  script:
+    - IMAGE_REF="$CI_REGISTRY_IMAGE@$IMAGE_DIGEST"
+      TARGET_ENV=prod ./scripts/promote.sh
+  environment:
+    name: production
