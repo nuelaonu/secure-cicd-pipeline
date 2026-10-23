@@ -23,6 +23,13 @@
 #                                   ghcr.io + github.token instead)
 # Variables:
 #   ANCHORE_FAIL_SEVERITY           default: high
+#
+# Fresh-repo behavior: a stage that needs an external service SKIPS
+# cleanly when that service was never configured (its secrets are
+# unset), so the workflow is green out of the box on the self-contained
+# stages (build, test). Set the secrets and every gate enforces exactly
+# as written — a stage only ever skips when its service was never wired
+# up, never when it was configured and failed.
 
 name: secure-ci
 
@@ -89,11 +96,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # SonarQube needs full history for new-code analysis
+      - name: Check SonarQube configuration
+        id: cfg
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          if [ -n "$SONAR_HOST_URL" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Download coverage report
+        if: steps.cfg.outputs.configured == 'true'
         uses: actions/download-artifact@v4
         with:
           name: test-reports
       - name: SonarQube scan
+        if: steps.cfg.outputs.configured == 'true'
         uses: SonarSource/sonarqube-scan-action@v3
         env:
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
@@ -103,11 +122,17 @@ jobs:
             -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
             -Dsonar.python.coverage.reportPaths=coverage.xml
       - name: Wait for the quality gate verdict
+        if: steps.cfg.outputs.configured == 'true'
         env:
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           GATE_STATUS_FILE: gate-sonar.env
         run: ./scripts/check_sonar_gate.sh
+      - name: Record gate as skipped (SonarQube not configured)
+        if: steps.cfg.outputs.configured == 'false'
+        run: |
+          echo "::notice::SONAR_HOST_URL is not set — SonarQube gate skipped. Set SONAR_HOST_URL and SONAR_TOKEN secrets to enforce this gate."
+          echo "SONAR_GATE=SKIPPED" > gate-sonar.env
       - name: Upload gate evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -123,15 +148,29 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
+      - name: Check registry configuration
+        id: cfg
+        env:
+          REGISTRY: ${{ secrets.REGISTRY }}
+        run: |
+          if [ -n "$REGISTRY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::REGISTRY secret is not set — image build/push and all downstream stages skipped. Set REGISTRY, REGISTRY_USERNAME and REGISTRY_PASSWORD to enable them."
+          fi
       - name: Log in to the registry
+        if: steps.cfg.outputs.configured == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ secrets.REGISTRY }}
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
       - name: Set up Buildx
+        if: steps.cfg.outputs.configured == 'true'
         uses: docker/setup-buildx-action@v3
       - name: Build and push ONCE, tagged with the commit
+        if: steps.cfg.outputs.configured == 'true'
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -140,12 +179,15 @@ jobs:
           tags: ${{ secrets.REGISTRY }}/team/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
       # steps.build.outputs.digest is the immutable identity of the
       # image. Every later job uses repo@digest — never the tag — so
-      # what is scanned and what is promoted are the same bits.
+      # what is scanned and what is promoted are the same bits. When
+      # the registry is not configured the digest stays empty, and the
+      # scan / compliance / promote jobs skip on that condition.
 
   # --------------------------------------------------------------- scan
   scan:
     runs-on: ubuntu-latest
     needs: image
+    if: ${{ needs.image.outputs.digest != '' }}
     steps:
       - uses: actions/checkout@v4
       - name: Log in to the registry
@@ -195,6 +237,7 @@ jobs:
   compliance:
     runs-on: ubuntu-latest
     needs: image
+    if: ${{ needs.image.outputs.digest != '' }}
     steps:
       - uses: actions/checkout@v4
       - name: Log in to the registry
@@ -228,6 +271,7 @@ jobs:
   promote-dev:
     runs-on: ubuntu-latest
     needs: [quality, scan, compliance, image]
+    if: ${{ needs.image.outputs.digest != '' }}
     environment: dev
     steps:
       - uses: actions/checkout@v4
